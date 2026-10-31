@@ -8,7 +8,7 @@
 //! Configuration for a resolver
 #![allow(clippy::use_self)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -196,6 +196,47 @@ impl ResolverConfig {
     pub fn name_servers(&self) -> &[NameServerConfig] {
         &self.name_servers
     }
+}
+
+/// Configuration for a resolver with additional name servers scoped to domains
+///
+/// A name under a scope's domain is resolved by that scope's name servers, the longest matching
+/// domain winning; every other name uses the default configuration. Only the default
+/// configuration's `domain` and `search` are applied to lookups. This is how macOS routes queries
+/// to its supplemental resolvers (see `scutil --dns`) and the files under `/etc/resolver`.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct ScopedConfig {
+    /// Configuration for names outside every scope
+    pub default: ResolverConfig,
+    /// Name servers for names under each domain, compared label-wise and case-insensitively
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub scopes: HashMap<Name, ResolverConfig>,
+}
+
+impl ScopedConfig {
+    /// Create a configuration without scopes
+    pub fn new(default: ResolverConfig) -> Self {
+        Self {
+            default,
+            scopes: HashMap::new(),
+        }
+    }
+
+    /// Returns the configuration that resolves `name`
+    pub fn config_for(&self, name: &Name) -> &ResolverConfig {
+        longest_match(&self.scopes, name).unwrap_or(&self.default)
+    }
+}
+
+/// Returns the scope with the longest domain that `name` is under
+pub(crate) fn longest_match<'a, T>(scopes: &'a HashMap<Name, T>, name: &Name) -> Option<&'a T> {
+    scopes
+        .iter()
+        .filter(|(domain, _)| domain.zone_of(name))
+        .max_by_key(|(domain, _)| domain.num_labels())
+        .map(|(_, scope)| scope)
 }
 
 /// Configuration for the NameServer
@@ -1202,9 +1243,45 @@ pub(crate) mod duration_opt {
     }
 }
 
-#[cfg(all(test, feature = "serde"))]
+#[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
+
+    fn scoped_config() -> ScopedConfig {
+        let scope =
+            |ip: [u8; 4]| ResolverConfig::from_name_servers(vec![NameServerConfig::udp(ip.into())]);
+        let mut config = ScopedConfig::new(scope([10, 0, 0, 1]));
+        config
+            .scopes
+            .insert(Name::from_str("ts.net").unwrap(), scope([10, 0, 0, 2]));
+        config.scopes.insert(
+            Name::from_str("corp.ts.net.").unwrap(),
+            scope([10, 0, 0, 3]),
+        );
+        config
+    }
+
+    #[test]
+    fn scope_selection() {
+        let config = scoped_config();
+        let ip_for = |name: &str| {
+            config
+                .config_for(&Name::from_str(name).unwrap())
+                .name_servers[0]
+                .ip
+        };
+
+        assert_eq!(ip_for("www.example.com."), IpAddr::from([10, 0, 0, 1]));
+        assert_eq!(ip_for("ts.network."), IpAddr::from([10, 0, 0, 1]));
+        assert_eq!(ip_for("net."), IpAddr::from([10, 0, 0, 1]));
+        assert_eq!(ip_for("ts.net."), IpAddr::from([10, 0, 0, 2]));
+        assert_eq!(ip_for("host.ts.net."), IpAddr::from([10, 0, 0, 2]));
+        assert_eq!(ip_for("HOST.TS.NET."), IpAddr::from([10, 0, 0, 2]));
+        assert_eq!(ip_for("host.corp.ts.net."), IpAddr::from([10, 0, 0, 3]));
+        assert_eq!(ip_for("Corp.TS.net"), IpAddr::from([10, 0, 0, 3]));
+    }
 
     #[cfg(feature = "serde")]
     #[test]
@@ -1241,6 +1318,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "serde")]
     #[test]
     fn connection_config_protocol_forms() {
         let config = toml::from_str::<ConnectionConfig>(r#"protocol = "udp""#).unwrap();

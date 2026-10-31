@@ -6,6 +6,7 @@
 // copied, modified, or distributed except according to those terms.
 
 //! Structs for creating and using a Resolver
+use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -27,7 +28,10 @@ use crate::net::runtime::TokioRuntimeProvider;
 use crate::{
     cache::{MAX_TTL, ResponseCache, TtlConfig},
     caching_client::CachingClient,
-    config::{OpportunisticEncryption, ResolveHosts, ResolverConfig, ResolverOpts},
+    config::{
+        OpportunisticEncryption, ResolveHosts, ResolverConfig, ResolverOpts, ScopedConfig,
+        longest_match,
+    },
     connection_provider::ConnectionProvider,
     hosts::Hosts,
     lookup::Lookup,
@@ -118,6 +122,12 @@ impl<R: ConnectionProvider> Resolver<R> {
 
     /// Construct a new [`Resolver`] via [`ResolverBuilder`] with the provided configuration.
     pub fn builder_with_config(config: ResolverConfig, provider: R) -> ResolverBuilder<R> {
+        Self::builder_with_scoped_config(ScopedConfig::new(config), provider)
+    }
+
+    /// Construct a new [`Resolver`] via [`ResolverBuilder`] with the provided configuration,
+    /// including name servers scoped to domains.
+    pub fn builder_with_scoped_config(config: ScopedConfig, provider: R) -> ResolverBuilder<R> {
         ResolverBuilder {
             config,
             options: ResolverOpts::default(),
@@ -378,9 +388,38 @@ impl<P: ConnectionProvider> fmt::Debug for Resolver<P> {
 /// Different lookup options for the lookup attempts and validation
 #[derive(Clone)]
 enum LookupEither<P: ConnectionProvider> {
-    Retry(RetryDnsHandle<NameServerPool<P>>),
+    Retry(RetryDnsHandle<ScopedPool<P>>),
     #[cfg(feature = "__dnssec")]
-    Secure(DnssecDnsHandle<RetryDnsHandle<NameServerPool<P>>>),
+    Secure(DnssecDnsHandle<RetryDnsHandle<ScopedPool<P>>>),
+}
+
+/// Sends each request to the pool for the scope its query name is under
+#[derive(Clone)]
+struct ScopedPool<P: ConnectionProvider> {
+    default: NameServerPool<P>,
+    scopes: HashMap<Name, NameServerPool<P>>,
+}
+
+impl<P: ConnectionProvider> ScopedPool<P> {
+    fn pool_for(&self, name: &Name) -> &NameServerPool<P> {
+        longest_match(&self.scopes, name).unwrap_or(&self.default)
+    }
+}
+
+impl<P: ConnectionProvider> DnsHandle for ScopedPool<P> {
+    type Response = <NameServerPool<P> as DnsHandle>::Response;
+    type Runtime = P::RuntimeProvider;
+
+    fn lookup(&self, query: Query, options: DnsRequestOptions) -> Self::Response {
+        self.pool_for(&query.name).lookup(query, options)
+    }
+
+    fn send(&self, request: DnsRequest) -> Self::Response {
+        match request.queries.first() {
+            Some(query) => self.pool_for(&query.name).send(request),
+            None => self.default.send(request),
+        }
+    }
 }
 
 impl<P: ConnectionProvider> DnsHandle for LookupEither<P> {
@@ -408,7 +447,7 @@ impl<P: ConnectionProvider> DnsHandle for LookupEither<P> {
 ///
 /// Created by [`Resolver::builder`].
 pub struct ResolverBuilder<P> {
-    config: ResolverConfig,
+    config: ScopedConfig,
     options: ResolverOpts,
     provider: P,
 
@@ -496,10 +535,14 @@ impl<P: ConnectionProvider> ResolverBuilder<P> {
         #[cfg_attr(not(feature = "__dnssec"), allow(unused_mut))]
         let Self {
             config:
-                ResolverConfig {
-                    domain,
-                    search,
-                    name_servers,
+                ScopedConfig {
+                    default:
+                        ResolverConfig {
+                            domain,
+                            search,
+                            name_servers,
+                        },
+                    scopes,
                 },
             mut options,
             provider,
@@ -537,7 +580,20 @@ impl<P: ConnectionProvider> ResolverBuilder<P> {
             transport_state: AsyncMutex::new(encrypted_transport_state),
         });
 
-        let pool = NameServerPool::from_config(name_servers, context.clone(), provider);
+        let pool = ScopedPool {
+            default: NameServerPool::from_config(name_servers, context.clone(), provider.clone()),
+            scopes: scopes
+                .into_iter()
+                .map(|(domain, config)| {
+                    let pool = NameServerPool::from_config(
+                        config.name_servers,
+                        context.clone(),
+                        provider.clone(),
+                    );
+                    (domain, pool)
+                })
+                .collect(),
+        };
 
         let client = RetryDnsHandle::new(pool, context.options.attempts);
 
@@ -1208,11 +1264,10 @@ pub(crate) mod testing {
 #[cfg(feature = "tokio")]
 #[allow(clippy::extra_unused_type_parameters)]
 mod tests {
+    use std::collections::HashSet;
     use std::net::{IpAddr, Ipv4Addr};
 
-    use test_support::subscribe;
-    #[cfg(feature = "__dnssec")]
-    use test_support::{MockNetworkHandler, MockProvider, MockRecord};
+    use test_support::{MockNetworkHandler, MockProvider, MockRecord, subscribe};
 
     #[cfg(all(unix, feature = "system-config"))]
     use super::testing::hosts_lookup_test;
@@ -1229,7 +1284,7 @@ mod tests {
     use super::*;
     #[cfg(feature = "__dnssec")]
     use crate::config::ServerGroup;
-    use crate::config::{CLOUDFLARE, GOOGLE, ResolverConfig, ResolverOpts};
+    use crate::config::{CLOUDFLARE, GOOGLE, NameServerConfig, ResolverConfig, ResolverOpts};
     use crate::lookup_ip::tests::{empty, error, mock, v4_message};
     use crate::net::DnsError;
     use crate::net::xfer::DnsExchange;
@@ -1453,6 +1508,55 @@ mod tests {
         for name in &not_tor_address {
             assert_eq!(resolver.build_names(name.clone()).len(), 2);
         }
+    }
+
+    #[tokio::test]
+    async fn test_scoped_lookup() {
+        subscribe();
+
+        let default_ns = IpAddr::from(Ipv4Addr::new(203, 0, 113, 1));
+        let scoped_ns = IpAddr::from(Ipv4Addr::new(203, 0, 113, 2));
+        let default_name = Name::from_ascii("host.testing.").unwrap();
+        let scoped_name = Name::from_ascii("host.scoped.testing.").unwrap();
+        let default_addr = Ipv4Addr::new(203, 0, 113, 10);
+        let scoped_addr = Ipv4Addr::new(203, 0, 113, 20);
+
+        let provider = MockProvider::new(MockNetworkHandler::new(vec![
+            MockRecord::a(default_ns, &default_name, default_addr.into()),
+            MockRecord::a(scoped_ns, &scoped_name, scoped_addr.into()),
+        ]));
+
+        let mut config = ScopedConfig::new(ResolverConfig::from_name_servers(vec![
+            NameServerConfig::udp_and_tcp(default_ns),
+        ]));
+        config.scopes.insert(
+            Name::from_ascii("scoped.testing.").unwrap(),
+            ResolverConfig::from_name_servers(vec![NameServerConfig::udp_and_tcp(scoped_ns)]),
+        );
+        let resolver = Resolver::builder_with_scoped_config(config, provider.clone())
+            .build()
+            .unwrap();
+
+        let lookup = resolver.lookup_ip(scoped_name.clone()).await.unwrap();
+        assert_eq!(
+            lookup.iter().collect::<Vec<_>>(),
+            [IpAddr::from(scoped_addr)]
+        );
+        let lookup = resolver.lookup_ip(default_name.clone()).await.unwrap();
+        assert_eq!(
+            lookup.iter().collect::<Vec<_>>(),
+            [IpAddr::from(default_addr)]
+        );
+
+        let names = |ns: &IpAddr| {
+            provider
+                .queries(ns)
+                .into_iter()
+                .map(|query| query.name)
+                .collect::<HashSet<_>>()
+        };
+        assert_eq!(names(&scoped_ns), HashSet::from([scoped_name]));
+        assert_eq!(names(&default_ns), HashSet::from([default_name]));
     }
 
     #[tokio::test]
