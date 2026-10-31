@@ -12,13 +12,27 @@
 //!  system, e.g. most Unixes have this written to `/etc/resolv.conf`
 #![allow(missing_docs)]
 
-#[cfg(all(unix, not(any(target_os = "android", target_vendor = "apple"))))]
+#[cfg(all(
+    feature = "system-config",
+    any(unix, windows),
+    not(target_vendor = "apple")
+))]
+use crate::{
+    config::{ResolverOpts, ScopedConfig},
+    net::NetError,
+};
+
+#[cfg(all(unix, not(target_os = "android")))]
 #[cfg(feature = "system-config")]
 mod unix;
 
+#[cfg(all(unix, not(target_os = "android")))]
+#[cfg(feature = "system-config")]
+pub use self::unix::parse_resolv_conf;
+
 #[cfg(all(unix, not(any(target_os = "android", target_vendor = "apple"))))]
 #[cfg(feature = "system-config")]
-pub use self::unix::{parse_resolv_conf, read_system_conf};
+pub use self::unix::read_system_conf;
 
 #[cfg(windows)]
 #[cfg(feature = "system-config")]
@@ -42,7 +56,21 @@ mod apple;
 
 #[cfg(target_vendor = "apple")]
 #[cfg(feature = "system-config")]
-pub use self::apple::read_system_conf;
+pub use self::apple::{read_scoped_system_conf, read_system_conf};
+
+/// Reads the system configuration as a [`ScopedConfig`]
+///
+/// Only Apple platforms configure resolvers per domain, so this is [`read_system_conf`] without
+/// scopes.
+#[cfg(all(
+    feature = "system-config",
+    any(unix, windows),
+    not(target_vendor = "apple")
+))]
+pub fn read_scoped_system_conf() -> Result<(ScopedConfig, ResolverOpts), NetError> {
+    let (config, options) = read_system_conf()?;
+    Ok((ScopedConfig::new(config), options))
+}
 
 #[cfg(all(feature = "system-config", any(windows, target_vendor = "apple")))]
 mod sanitize {

@@ -110,12 +110,13 @@ impl<R: ConnectionProvider> Resolver<R> {
     ///
     /// To use this with Tokio, see [TokioResolver::builder_tokio] instead.
     ///
-    /// This will use `/etc/resolv.conf` on Unix OSes and the registry on Windows.
+    /// This will use `/etc/resolv.conf` on Unix OSes, the registry on Windows and the System
+    /// Configuration on Apple platforms, including its resolvers scoped to domains.
     #[cfg(any(unix, target_os = "windows"))]
     #[cfg(feature = "system-config")]
     pub fn builder(provider: R) -> Result<ResolverBuilder<R>, NetError> {
-        let (config, options) = super::system_conf::read_system_conf()?;
-        let mut builder = Self::builder_with_config(config, provider);
+        let (config, options) = super::system_conf::read_scoped_system_conf()?;
+        let mut builder = Self::builder_with_scoped_config(config, provider);
         *builder.options_mut() = options;
         Ok(builder)
     }

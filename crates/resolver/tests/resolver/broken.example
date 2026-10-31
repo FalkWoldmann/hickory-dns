@@ -1,0 +1,2 @@
+# no nameserver, so this resolver is skipped
+search_order 200

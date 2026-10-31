@@ -1,0 +1,6 @@
+# split DNS for the office, served by a local forwarder
+search corp.example
+nameserver 10.0.0.53
+port 2053
+timeout 5
+search_order 100

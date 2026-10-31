@@ -1,0 +1,5 @@
+# like macOS Containerization writes it: the domain directive beats the file name
+domain test
+search test
+nameserver 127.0.0.1
+port 2053

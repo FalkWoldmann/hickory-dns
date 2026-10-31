@@ -11,9 +11,7 @@
 //!  the host system. It will read from the default location on each operating
 //!  system, e.g. most Unixes have this written to `/etc/resolv.conf`
 
-use std::fs;
 use std::io;
-use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -23,12 +21,9 @@ use crate::config::{NameServerConfig, ResolverConfig, ResolverOpts};
 use crate::net::NetError;
 use crate::proto::rr::Name;
 
+#[cfg(not(target_vendor = "apple"))]
 pub fn read_system_conf() -> Result<(ResolverConfig, ResolverOpts), NetError> {
-    read_resolv_conf("/etc/resolv.conf")
-}
-
-fn read_resolv_conf<P: AsRef<Path>>(path: P) -> Result<(ResolverConfig, ResolverOpts), NetError> {
-    parse_resolv_conf(fs::read(path)?)
+    parse_resolv_conf(std::fs::read("/etc/resolv.conf")?)
 }
 
 pub fn parse_resolv_conf(
@@ -169,6 +164,10 @@ mod tests {
         assert_eq!(cfg.name_servers()[0].ip, parsed.0.name_servers()[0].ip);
         assert_eq!(cfg.domain(), parsed.0.domain());
         is_default_opts(parsed.1);
+    }
+
+    fn read_resolv_conf(path: String) -> Result<(ResolverConfig, ResolverOpts), NetError> {
+        parse_resolv_conf(std::fs::read(path)?)
     }
 
     #[test]
